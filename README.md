@@ -1,6 +1,6 @@
 # Jetpack Joyride (PS3) on Windows - community build kit
 
-Runs **your own copy** of *Jetpack Joyride Deluxe* (PSN `NPUB31615`) natively on Windows by statically recompiling
+Runs **your own copy** of the v1.02 US release *Jetpack Joyride Deluxe* (PSN `NPUB31615`) natively on Windows by statically recompiling
 the PS3 game with [ps3recomp](https://github.com/sp00nznet/ps3recomp). This repository contains **only tooling and patches -
 no game files, no recompiled game code, no game executable**. You build everything yourself from your own game.
 
@@ -24,7 +24,7 @@ them. This is for personal use. See [NOTICE.md](NOTICE.md).
 - **Visual Studio 2022 Build Tools** with: *Desktop development with C++*, *C++ Clang tools for Windows*,
   *C++ CMake tools for Windows*, and a Windows 10/11 SDK
 - **Git for Windows** and **Python 3.10+** (tick "Add python.exe to PATH")
-- From your own copy of the game: the **decrypted** `EBOOT.elf`, `jet.pak` and `sound.pak` (plain files - the original
+- From your own copy of the game: v1.02 update, the **decrypted** `EBOOT.elf`, `jet.pak` and `sound.pak` (plain files - the original
   `jet.pak.edat` / `sound.pak.edat` and `EBOOT.BIN` are encrypted and will be rejected), plus the extracted game folder
   (contains `PARAM.SFO` and `USRDIR\movies\BS_ShirtSleeves_Final.avi`). This project does not include, and cannot
   create, the decrypted files: you must already have them from your own copy of the game.
@@ -88,6 +88,10 @@ Copy the repository to a new folder and run the Install steps there; don't reuse
 ## License
 The tooling, scripts and patch in this repository are [MIT licensed](LICENSE). The game itself is not covered and is not
 included.
+
+## Credits
+[ps3recomp](https://github.com/sp00nznet/ps3recomp) by sp00nznet. Game by Halfbrick Studios.
+
 
 ## Credits
 [ps3recomp](https://github.com/sp00nznet/ps3recomp) by sp00nznet. Game by Halfbrick Studios.
