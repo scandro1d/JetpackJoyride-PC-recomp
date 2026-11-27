@@ -1,0 +1,770 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index f231ea26..1970dacb 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -426,6 +426,9 @@ static void audio_backend_wait(void)
+  * every sample must be byte-swapped before use. Reading it as a host float
+  * turned the whole mix into denormal noise -- silence after clipping (LBP
+  * had a verified end-to-end pipeline with no audible output). */
++/* SETTINGS_PATCH: master volume set by the settings window (1.0 = default) */
++volatile float g_ps3_master_vol = 1.0f;
++extern volatile float g_ps3_sfx_gain; /* MSVOL_PATCH: defined in runtime/spu/spu_channels.c */
+ static inline float ld_be_f32(const float* p)
+ {
+     u32 v;
+@@ -547,10 +550,16 @@ static void audio_mix_one_block(void)
+ 
+     mutex_unlock(&s_audio_mutex);
+ 
+-    /* Clip to [-1.0, 1.0] */
+-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
++    /* SOFTCLIP_PATCH: master gain BEFORE limiting, then a soft knee above 0.7 (asymptote 1.0) */
++    {
++        static float s_g = -1.0f;
++        if (s_g < 0.0f) { const char* e = getenv("AUDIO_GAIN"); s_g = e ? (float)atof(e) : 0.35f; if (s_g < 0.0f) s_g = 0.35f; }
++        for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
++            float v = s_mix_buffer[i] * s_g * g_ps3_master_vol * g_ps3_sfx_gain; /* MSVOL_PATCH */
++            float a = v < 0.0f ? -v : v;
++            if (a > 0.7f) { float x = (a - 0.7f) * (1.0f / 0.3f); a = 0.7f + 0.3f * (x / (1.0f + x)); }
++            s_mix_buffer[i] = v < 0.0f ? -a : a;
++        }
+     }
+ }
+ 
+@@ -586,6 +595,17 @@ static float audio_mix_peak(void)
+ 
+ /* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
+  * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
++/* AUDIOGAIN_PATCH: master gain + limiter on the final mix (AUDIO_GAIN, default 1.0 unless set) */
++static void audio_apply_gain(void)
++{
++    static float g = -1.0f;
++    if (g < 0.0f) { const char* e = getenv("AUDIO_GAIN"); g = e ? (float)atof(e) : 1.0f; if (g < 0.0f) g = 1.0f; }
++    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
++        float v = s_mix_buffer[i]; (void)g;
++        if (v > 0.98f) v = 0.98f; else if (v < -0.98f) v = -0.98f;
++        s_mix_buffer[i] = v;
++    }
++}
+ static void audio_dump_mix(void)
+ {
+     static FILE* wf = (FILE*)-1;
+@@ -650,6 +670,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+           if (_ap) { static unsigned _n = 0; const float pk = audio_mix_peak();
+             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
+                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
++        audio_apply_gain();
+         audio_dump_mix();
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
+@@ -686,6 +707,7 @@ static void* audio_mix_thread_func(void* arg)
+     unsigned long blocks = 0; float peak = 0.0f;
+     while (s_mix_thread_running) {
+         audio_mix_one_block();
++        audio_apply_gain();
+         audio_dump_mix();
+         audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+         audio_notify_event_queues();
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 5f8a2fa2..7951eac9 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -301,6 +301,19 @@ static int pad_key_down(int key)
+ #define PADKEY_TAB SDL_SCANCODE_TAB
+ #endif
+ 
++/* SETTINGS_PATCH: remappable bindings (edited by the settings window). Index = PS3 button:
++ * 0 UP 1 DOWN 2 LEFT 3 RIGHT 4 CROSS 5 CIRCLE 6 SQUARE 7 TRIANGLE 8 L1 9 R1 10 L2 11 R2 12 START 13 SELECT 14 L3 15 R3 */
++static const u16 g_pad_ps3_btn[16] = {
++    CELL_PAD_CTRL_UP, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_RIGHT,
++    CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_SQUARE, CELL_PAD_CTRL_TRIANGLE,
++    CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1, CELL_PAD_CTRL_L2, CELL_PAD_CTRL_R2,
++    CELL_PAD_CTRL_START, CELL_PAD_CTRL_SELECT, CELL_PAD_CTRL_L3, CELL_PAD_CTRL_R3 };
++volatile int g_ps3_pad_block = 0; /* PADBLOCK_PATCH */
++int g_pad_kb_vk[16] = { PADKEY_UP, PADKEY_DOWN, PADKEY_LEFT, PADKEY_RIGHT, PADKEY_Z, PADKEY_X, PADKEY_A, PADKEY_S,
++                        PADKEY_Q, PADKEY_W, PADKEY_1, PADKEY_2, PADKEY_RETURN, PADKEY_TAB, 0, 0 };
++/* XInput wButtons mask per PS3 button; 0x10000 = left trigger, 0x20000 = right trigger */
++unsigned g_pad_xi_mask[16] = { 0x0001, 0x0002, 0x0004, 0x0008, 0x1000, 0x2000, 0x4000, 0x8000,
++                               0x0100, 0x0200, 0x10000, 0x20000, 0x0010, 0x0020, 0x0040, 0x0080 };
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
+@@ -318,19 +331,10 @@ static void pad_poll_keyboard(void)
+         return;
+     }
+ 
+-    static const struct { int vk; u16 btn; } map[] = {
+-        { PADKEY_UP,     CELL_PAD_CTRL_UP },      { PADKEY_DOWN,  CELL_PAD_CTRL_DOWN },
+-        { PADKEY_LEFT,   CELL_PAD_CTRL_LEFT },    { PADKEY_RIGHT, CELL_PAD_CTRL_RIGHT },
+-        { PADKEY_Z,      CELL_PAD_CTRL_CROSS },   { PADKEY_X,     CELL_PAD_CTRL_CIRCLE },
+-        { PADKEY_A,      CELL_PAD_CTRL_SQUARE },  { PADKEY_S,     CELL_PAD_CTRL_TRIANGLE },
+-        { PADKEY_Q,      CELL_PAD_CTRL_L1 },      { PADKEY_W,     CELL_PAD_CTRL_R1 },
+-        { PADKEY_1,      CELL_PAD_CTRL_L2 },      { PADKEY_2,     CELL_PAD_CTRL_R2 },
+-        { PADKEY_RETURN, CELL_PAD_CTRL_START },   { PADKEY_TAB,   CELL_PAD_CTRL_SELECT },
+-    };
+ 
+     u16 btns = 0;
+-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+-        if (pad_key_down(map[i].vk)) btns |= map[i].btn;
++    for (unsigned i = 0; i < 16; i++)
++        if (g_pad_kb_vk[i] && pad_key_down(g_pad_kb_vk[i])) btns |= g_pad_ps3_btn[i];
+ 
+     hs->buttons   = btns;
+     hs->connected = 1;
+@@ -439,26 +443,17 @@ static void pad_poll_xinput(void)
+         s_pad_empty_until[i] = 0;
+ 
+         s_host_state[i].connected = 1;
+-        XINPUT_GAMEPAD* gp = &state.Gamepad;
++        XINPUT_GAMEPAD* gp = &state.Gamepad; { extern volatile int g_ps3_pad_block; if (g_ps3_pad_block) memset(gp, 0, sizeof *gp); } /* PADBLOCK_PATCH */
+ 
+         /* Map XInput buttons to PS3 CELL_PAD_CTRL_* */
+         u16 btns = 0;
+-        if (gp->wButtons & XINPUT_GAMEPAD_BACK)           btns |= CELL_PAD_CTRL_SELECT;
+-        if (gp->wButtons & XINPUT_GAMEPAD_LEFT_THUMB)     btns |= CELL_PAD_CTRL_L3;
+-        if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_THUMB)    btns |= CELL_PAD_CTRL_R3;
+-        if (gp->wButtons & XINPUT_GAMEPAD_START)          btns |= CELL_PAD_CTRL_START;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_UP)        btns |= CELL_PAD_CTRL_UP;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT)     btns |= CELL_PAD_CTRL_RIGHT;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_DOWN)      btns |= CELL_PAD_CTRL_DOWN;
+-        if (gp->wButtons & XINPUT_GAMEPAD_DPAD_LEFT)      btns |= CELL_PAD_CTRL_LEFT;
+-        if (gp->bLeftTrigger > PAD_TRIGGER_THRESHOLD)     btns |= CELL_PAD_CTRL_L2;
+-        if (gp->bRightTrigger > PAD_TRIGGER_THRESHOLD)    btns |= CELL_PAD_CTRL_R2;
+-        if (gp->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER)  btns |= CELL_PAD_CTRL_L1;
+-        if (gp->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) btns |= CELL_PAD_CTRL_R1;
+-        if (gp->wButtons & XINPUT_GAMEPAD_Y)              btns |= CELL_PAD_CTRL_TRIANGLE;
+-        if (gp->wButtons & XINPUT_GAMEPAD_B)              btns |= CELL_PAD_CTRL_CIRCLE;
+-        if (gp->wButtons & XINPUT_GAMEPAD_A)              btns |= CELL_PAD_CTRL_CROSS;
+-        if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
++        {
++            unsigned xi = (unsigned)gp->wButtons;
++            if (gp->bLeftTrigger > PAD_TRIGGER_THRESHOLD)  xi |= 0x10000u;
++            if (gp->bRightTrigger > PAD_TRIGGER_THRESHOLD) xi |= 0x20000u;
++            for (unsigned bi = 0; bi < 16; bi++)
++                if (g_pad_xi_mask[bi] && (xi & g_pad_xi_mask[bi])) btns |= g_pad_ps3_btn[bi];
++        }
+ 
+         s_host_state[i].buttons = btns;
+ 
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 854739e7..3cd705f7 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -1875,7 +1875,7 @@ static void compile_vp(void)
+     s_d3d.vp_compiled_bytes = st->vp_ucode_bytes;
+     if (SUCCEEDED(hr)) { s_d3d.vp_ready = 1; printf("[VP] pipeline ready (%d instrs)\n", ni); }
+     else {
+-        printf("[VP] PSO creation FAIL (0x%08lX)\n", hr);
++        printf("[VP] PSO creation FAIL (0x%08lX)\n", hr); /* REMOVEDRSN_PATCH */ printf("[VP] device removed reason: 0x%08lX\n", (unsigned long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device));
+         /* Drain the debug layer's message queue to get the EXACT validation
+          * reason (E_INVALIDARG is otherwise opaque). One-shot. */
+         ID3D12InfoQueue* iq = NULL;
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index be125294..47274e2c 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1234,6 +1234,25 @@ static SRWLOCK g_ld_access_lock = SRWLOCK_INIT;
+ static volatile LONG g_ld_guest_active = 0;
+ static volatile LONG g_ld_host_waiting = 0;
+ 
++/* RENDERSCALE_PATCH: internal render scale (env RSX_RENDER_SCALE, set from the settings window). 1.0 = guest size. */
++static float ld_render_scale(void)
++{
++    static float s = 0.0f;
++    if (s == 0.0f) {
++        const char* e = getenv("RSX_RENDER_SCALE");
++        s = e ? (float)atof(e) : 1.0f;
++        if (!(s >= 0.25f && s <= 4.0f)) s = 1.0f;
++        fprintf(stderr, "[render-scale] %.4f\n", s);
++    }
++    return s;
++}
++static u32 ld_sc(u32 v)
++{
++    const float s = ld_render_scale();
++    if (s == 1.0f) return v;
++    const u32 r = (u32)((float)v * s + 0.5f);
++    return (v && !r) ? 1u : r; /* SCALEFIX_PATCH: 0 stays 0 (positions); sizes never collapse to 0 */
++}
+ static const u8* guest_ptr(u32 location, u32 offset, u32 min_bytes)
+ {
+     if (!g.guest_ptr) return NULL;
+@@ -2905,7 +2924,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    rd.Width = want_w; rd.Height = want_h; rd.DepthOrArraySize = 1;
++    rd.Width = ld_sc(want_w); rd.Height = ld_sc(want_h); rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1; rd.Format = want_fmt; rd.SampleDesc.Count = 1;
+     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+     D3D12_CLEAR_VALUE cv = {0}; cv.Format = rd.Format;
+@@ -3025,7 +3044,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
+         s->swin[k].tex = NULL;
+         D3D12_RESOURCE_DESC rd;
+         s->tex->lpVtbl->GetDesc(s->tex, &rd);              /* the surface's format and sample count */
+-        rd.Width = w; rd.Height = h; rd.Alignment = 0;
++        rd.Width = ld_sc(w); rd.Height = ld_sc(h); rd.Alignment = 0;
+         rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+         D3D12_HEAP_PROPERTIES hp = {0};
+         hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -3070,7 +3089,7 @@ static int surface_window(u32 si, const rsx_dsp_texture* t, int dbg)
+         D3D12_TEXTURE_COPY_LOCATION dst = {0}, src = {0};
+         dst.pResource = s->swin[k].tex; dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+         src.pResource = s->tex;         src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+-        D3D12_BOX box = { 0, 0, 0, w, h, 1 };
++        D3D12_BOX box = { 0, 0, 0, ld_sc(w), ld_sc(h), 1 };
+         g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, &box);
+         b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+         b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -3335,6 +3354,137 @@ static int ld_downsample(u32 si, u32 sx, u32 sy, u32 k,
+  * CopyTextureRegion can express. Draw one triangle covering the destination
+  * rect and sample the source surface with a linear clamp sampler.
+  * One root signature, one PSO per destination format (cached). */
++/* SHARPEN_PATCH: contrast-adaptive sharpening applied when the finished frame is presented. */
++volatile int g_ps3_sharpen = 35;   /* 0..100, set live from the settings window */
++static ID3D12RootSignature* g_sharp_rs;
++static ID3D12PipelineState* g_sharp_pso;
++static int g_sharp_failed;
++
++static int ld_sharpen_ready(void)
++{
++    if (g_sharp_pso) return 1;
++    if (g_sharp_failed) return 0;
++    g_sharp_failed = 1;
++    static const char src[] =
++        /* SHARPEN2_PATCH */
++"cbuffer C : register(b0) { float4 k; };\n"
++        "Texture2D t0 : register(t0);\n"
++        "float4 vs(uint id : SV_VertexID) : SV_Position {\n"
++        "    float2 q = float2((id << 1) & 2, id & 2);\n"
++        "    return float4(q * float2(2, -2) + float2(-1, 1), 0, 1); }\n"
++        "float4 ps(float4 p : SV_Position) : SV_Target {\n"
++        "    uint w, h; t0.GetDimensions(w, h);\n"
++        "    int2 c = int2(p.xy); int2 lim = int2(w - 1, h - 1); int r = max(1, (int)(k.y + 0.5));\n"
++        "    float4 m = t0.Load(int3(c, 0));\n"
++        "    float3 a = t0.Load(int3(clamp(c + int2(0, -r), int2(0, 0), lim), 0)).rgb;\n"
++        "    float3 b = t0.Load(int3(clamp(c + int2(-r, 0), int2(0, 0), lim), 0)).rgb;\n"
++        "    float3 d = t0.Load(int3(clamp(c + int2(r, 0), int2(0, 0), lim), 0)).rgb;\n"
++        "    float3 e = t0.Load(int3(clamp(c + int2(0, r), int2(0, 0), lim), 0)).rgb;\n"
++        "    float3 mn = min(min(min(a, b), min(d, e)), m.rgb);\n"
++        "    float3 mx = max(max(max(a, b), max(d, e)), m.rgb);\n"
++        "    float3 blur = (a + b + d + e) * 0.25;\n"
++        "    float3 o = m.rgb + (m.rgb - blur) * (k.x * 3.0);\n"
++        "    o = clamp(o, mn - 0.06, mx + 0.06);\n"
++        "    return float4(saturate(o), m.a); }\n";
++    D3D12_DESCRIPTOR_RANGE range = {0};
++    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    range.NumDescriptors = 1;
++    D3D12_ROOT_PARAMETER p[2] = {0};
++    p[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    p[0].Constants.Num32BitValues = 4;
++    p[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    p[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    p[1].DescriptorTable.NumDescriptorRanges = 1;
++    p[1].DescriptorTable.pDescriptorRanges = &range;
++    p[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_SIGNATURE_DESC rsd = {0};
++    rsd.NumParameters = 2; rsd.pParameters = p;
++    ID3DBlob* sig = NULL; ID3DBlob* err = NULL;
++    if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
++        if (err) err->lpVtbl->Release(err);
++        return 0;
++    }
++    HRESULT hr = g.dev->lpVtbl->CreateRootSignature(g.dev, 0, sig->lpVtbl->GetBufferPointer(sig),
++                     sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&g_sharp_rs);
++    sig->lpVtbl->Release(sig);
++    if (FAILED(hr)) { g_sharp_rs = NULL; return 0; }
++    ID3DBlob* vs = NULL; ID3DBlob* ps = NULL; err = NULL;
++    if (FAILED(D3DCompile(src, sizeof(src) - 1u, "ld_sharpen", NULL, NULL, "vs", "vs_5_0", 0, 0, &vs, &err)) ||
++        FAILED(D3DCompile(src, sizeof(src) - 1u, "ld_sharpen", NULL, NULL, "ps", "ps_5_0", 0, 0, &ps, &err))) {
++        fprintf(stderr, "[sharpen] shader compile failed: %s\n",
++                err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?");
++        if (err) err->lpVtbl->Release(err);
++        if (vs) vs->lpVtbl->Release(vs);
++        return 0;
++    }
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
++    pd.pRootSignature = g_sharp_rs;
++    pd.VS.pShaderBytecode = vs->lpVtbl->GetBufferPointer(vs); pd.VS.BytecodeLength = vs->lpVtbl->GetBufferSize(vs);
++    pd.PS.pShaderBytecode = ps->lpVtbl->GetBufferPointer(ps); pd.PS.BytecodeLength = ps->lpVtbl->GetBufferSize(ps);
++    pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    pd.SampleMask = 0xFFFFFFFFu;
++    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++    pd.RasterizerState.DepthClipEnable = TRUE;
++    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    pd.NumRenderTargets = 1;
++    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++    pd.SampleDesc.Count = 1;
++    hr = g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pd, &IID_ID3D12PipelineState, (void**)&g_sharp_pso);
++    vs->lpVtbl->Release(vs); ps->lpVtbl->Release(ps);
++    if (FAILED(hr)) { fprintf(stderr, "[sharpen] PSO failed hr=0x%08lX\n", (unsigned long)hr); g_sharp_pso = NULL; return 0; }
++    g_sharp_failed = 0;
++    fprintf(stderr, "[sharpen] ready\n");
++    return 1;
++}
++
++/* Call with srcimg in RENDER_TARGET state and bb in PRESENT state (same size). Overwrites bb with the sharpened frame. */
++static int ld_sharpen_present(ID3D12Resource* srcimg, ID3D12Resource* bb, u32 target, u32 w, u32 h)
++{
++    if (!ld_sharpen_ready()) return 0;
++    u32 slots[SRV_TABLE_SIZE];
++    for (u32 i = 0; i < SRV_TABLE_SIZE; i++) slots[i] = SRV_WHITE;
++    slots[0] = SRV_SURFACE_BASE + target;
++    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
++    if (!table.ptr) return 0;
++    D3D12_RESOURCE_BARRIER b[2] = {0};
++    b[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[0].Transition.pResource = srcimg;
++    b[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    b[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b[1].Transition.pResource = bb;
++    b[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++
++    const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv = rtv_handle(bbi);
++    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &rtv, FALSE, NULL);
++    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
++    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
++    g.list->lpVtbl->SetPipelineState(g.list, g_sharp_pso);
++    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g_sharp_rs);
++    int sv = g_ps3_sharpen; if (sv < 0) sv = 0; if (sv > 100) sv = 100;
++    const float k[4] = { (float)sv / 100.0f, ld_render_scale(), 0.0f, 0.0f };
++    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, k, 0);
++    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
++    D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)w, (float)h, 0.0f, 1.0f };
++    D3D12_RECT sc = { 0, 0, (LONG)w, (LONG)h };
++    g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
++    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
++    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
++
++    b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++    b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    g.list->lpVtbl->ResourceBarrier(g.list, 2, b);
++    return 1;
++}
+ static ID3D12RootSignature* g_sblit_rs;
+ static struct { DXGI_FORMAT fmt; ID3D12PipelineState* pso; } g_sblit_pso[4];
+ 
+@@ -3447,8 +3597,8 @@ static int ld_scaled_blit(u32 si, float sx, float sy, float sw, float sh,
+                          (sx + sw) / (float)s->w, (sy + sh) / (float)s->h };
+     g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, r, 0);
+     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+-    D3D12_VIEWPORT vp = { (float)dx, (float)dy, (float)dw, (float)dh, 0.0f, 1.0f };
+-    D3D12_RECT sc = { (LONG)dx, (LONG)dy, (LONG)(dx + dw), (LONG)(dy + dh) };
++    D3D12_VIEWPORT vp = { (float)ld_sc(dx), (float)ld_sc(dy), (float)(ld_sc(dx + dw) - ld_sc(dx)), (float)(ld_sc(dy + dh) - ld_sc(dy)), 0.0f, 1.0f };
++    D3D12_RECT sc = { (LONG)ld_sc(dx), (LONG)ld_sc(dy), (LONG)ld_sc(dx + dw), (LONG)ld_sc(dy + dh) };
+     g.list->lpVtbl->RSSetViewports(g.list, 1, &vp);
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+@@ -3538,8 +3688,8 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds,
+     D3D12_TEXTURE_COPY_LOCATION sl = {0}, dl = {0};
+     sl.pResource = s;        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+     dl.pResource = dst->tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+-    D3D12_BOX box = { sx, sy, 0, sx + w, sy + h, 1 };
+-    g.list->lpVtbl->CopyTextureRegion(g.list, &dl, dx, dy, 0, &sl, &box);
++    D3D12_BOX box = { ld_sc(sx), ld_sc(sy), 0, ld_sc(sx + w), ld_sc(sy + h), 1 };
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dl, ld_sc(dx), ld_sc(dy), 0, &sl, &box);
+     for (int q = 0; q < 2; q++) {
+         b[q].Transition.StateBefore = b[q].Transition.StateAfter;
+         b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -3604,8 +3754,8 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
+     D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
+     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+     d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+-    D3D12_BOX box = { sx, sy, 0, sx + w, sy + h, 1 };
+-    g.list->lpVtbl->CopyTextureRegion(g.list, &d, dx, dy, 0, &s, &box);
++    D3D12_BOX box = { ld_sc(sx), ld_sc(sy), 0, ld_sc(sx + w), ld_sc(sy + h), 1 };
++    g.list->lpVtbl->CopyTextureRegion(g.list, &d, ld_sc(dx), ld_sc(dy), 0, &s, &box);
+     for (int k = 0; k < 2; k++) {
+         b[k].Transition.StateBefore = b[k].Transition.StateAfter;
+         b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -3671,8 +3821,8 @@ static void zdepth_grow_snapshot(u32 i, u32 rt_w, u32 rt_h)
+     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    rd.Width = nw;
+-    rd.Height = nh;
++    rd.Width = ld_sc(nw);
++    rd.Height = ld_sc(nh);
+     rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1;
+     rd.Format = DXGI_FORMAT_R32_FLOAT;
+@@ -3757,8 +3907,8 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    rd.Width = want_w;
+-    rd.Height = want_h;
++    rd.Width = ld_sc(want_w);
++    rd.Height = ld_sc(want_h);
+     rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1;
+     rd.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+@@ -3803,8 +3953,8 @@ static u32 zdepth_get(u32 location, u32 offset, u32 rt_w, u32 rt_h)
+      * not a depth-resource copy operation. */
+     D3D12_RESOURCE_DESC snapshot_rd = {0};
+     snapshot_rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    snapshot_rd.Width = z->snapshot_w;
+-    snapshot_rd.Height = z->snapshot_h;
++    snapshot_rd.Width = ld_sc(z->snapshot_w);
++    snapshot_rd.Height = ld_sc(z->snapshot_h);
+     snapshot_rd.DepthOrArraySize = 1;
+     snapshot_rd.MipLevels = 1;
+     snapshot_rd.Format = DXGI_FORMAT_R32_FLOAT;
+@@ -7807,6 +7957,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             if (sc.bottom < sc.top)      sc.bottom = sc.top;
+         }
+     }
++    { const float _rs = ld_render_scale(); if (_rs != 1.0f) { dvp.Width *= _rs; dvp.Height *= _rs; sc.left = (LONG)((float)sc.left * _rs + 0.5f); sc.top = (LONG)((float)sc.top * _rs + 0.5f); sc.right = (LONG)((float)sc.right * _rs + 0.5f); sc.bottom = (LONG)((float)sc.bottom * _rs + 0.5f); } }
+     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+     /* Dynamic stencil reference (kept out of the PSO key on purpose). */
+@@ -8368,7 +8519,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+ 
+     /* swap chain bound to the runtime's HWND */
+     DXGI_SWAP_CHAIN_DESC1 scd = {0};
+-    scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    scd.Width = ld_sc(width); scd.Height = ld_sc(height); scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+     IDXGISwapChain1* sc1 = NULL;
+@@ -8474,7 +8625,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+         D3D12_HEAP_PROPERTIES dhp = {0}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
+         D3D12_RESOURCE_DESC drd = {0};
+         drd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-        drd.Width = width; drd.Height = height; drd.DepthOrArraySize = 1;
++        drd.Width = ld_sc(width); drd.Height = ld_sc(height); drd.DepthOrArraySize = 1;
+         drd.MipLevels = 1; drd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; drd.SampleDesc.Count = 1;
+         drd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+         D3D12_CLEAR_VALUE dcv = {0}; dcv.Format = drd.Format; dcv.DepthStencil.Depth = 1.0f;
+@@ -8543,7 +8694,60 @@ void rsx_live_draw_set_display_buffer(
+             buffer_id, location, offset, pitch, width, height);
+ }
+ 
++/* ARRAYELEM_PATCH: immediate-index draws (NV4097_ARRAY_ELEMENT16 0x180C / ARRAY_ELEMENT32 0x1810).
++ * Indices are collected and, at SET_BEGIN_END(0), replayed as SET_INDEX_ARRAY_ADDRESS/DMA + DRAW_INDEX_ARRAY
++ * over a host ring (served to the engine through the guest_ptr callback at offsets >= 0xF0000000). */
++#define AE_SENT      0xF0000000u
++#define AE_RING_BYTES (4u * 1024u * 1024u)
++#define AE_MAX_IDX   65536u
++static u8  s_ae_ring[AE_RING_BYTES];
++static u32 s_ae_off;
++static u32 s_ae_idx[AE_MAX_IDX];
++static u32 s_ae_n;
++static void ld_method_impl(u32 method, u32 arg);
++const u8* rsx_synth_idx_ptr(u32 off, u32 bytes)
++{
++    if ((u64)off + bytes > AE_RING_BYTES) return NULL;
++    return s_ae_ring + off;
++}
++static void ae_flush(u32 sub)
++{
++    u32 n = s_ae_n;
++    s_ae_n = 0;
++    if (!n) return;
++    if (n * 4u > AE_RING_BYTES) n = AE_RING_BYTES / 4u;
++    if (s_ae_off + n * 4u > AE_RING_BYTES) s_ae_off = 0;
++    const u32 base = s_ae_off;
++    for (u32 i = 0; i < n; i++) {
++        u8* p = s_ae_ring + base + i * 4u;
++        const u32 v = s_ae_idx[i];
++        p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16); p[2] = (u8)(v >> 8); p[3] = (u8)v;
++    }
++    s_ae_off = (base + n * 4u + 15u) & ~15u;
++    ld_method_impl((sub << 13) | 0x181Cu, AE_SENT + base);
++    ld_method_impl((sub << 13) | 0x1820u, 0x00000001u);     /* location 1, type 0 = 32-bit */
++    for (u32 first = 0; first < n; first += 256u) {
++        u32 c = n - first; if (c > 256u) c = 256u;
++        ld_method_impl((sub << 13) | 0x1824u, (first & 0xFFFFFFu) | ((c - 1u) << 24));
++    }
++}
+ void rsx_live_draw_method(u32 method, u32 arg)
++{
++    const u32 cm = method & 0x1FFCu, sub = (method >> 13) & 7u;
++    if (cm == 0x180Cu) {
++        if (s_ae_n + 2u <= AE_MAX_IDX) { s_ae_idx[s_ae_n++] = arg & 0xFFFFu; s_ae_idx[s_ae_n++] = arg >> 16; }
++        return;
++    }
++    if (cm == 0x1810u) {
++        if (s_ae_n + 1u <= AE_MAX_IDX) s_ae_idx[s_ae_n++] = arg;
++        return;
++    }
++    if (cm == 0x1808u) {
++        if (arg == 0) ae_flush(sub); else s_ae_n = 0;
++    }
++    ld_method_impl(method, arg);
++}
++static void ld_method_impl(u32 method, u32 arg)
+ {
+     /* Bounded ingress trace for the a010 live-vs-capture comparison.  Keep the
+      * raw method (including its FIFO subchannel bits) visible: if an SPU-built
+@@ -9419,7 +9623,27 @@ void rsx_live_draw_present(u32 buffer_id)
+     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+ 
+-    g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
++    /* PRESENTFIX_PATCH: CopyResource needs identical sizes; copy the overlapping region otherwise. */
++    {
++        D3D12_RESOURCE_DESC _sd, _dd;
++        srcimg->lpVtbl->GetDesc(srcimg, &_sd);
++        bb->lpVtbl->GetDesc(bb, &_dd);
++        if (_sd.Width == _dd.Width && _sd.Height == _dd.Height) {
++            g.list->lpVtbl->CopyResource(g.list, bb, srcimg);
++        } else {
++            static int _pl = 0;
++            if (_pl++ < 8)
++                fprintf(stderr, "[present-size] surface %u is %ux%u (fmt %d) but the swap chain is %ux%u (fmt %d) - copying the overlap\n",
++                        target, (unsigned)_sd.Width, (unsigned)_sd.Height, (int)_sd.Format,
++                        (unsigned)_dd.Width, (unsigned)_dd.Height, (int)_dd.Format);
++            D3D12_TEXTURE_COPY_LOCATION _dl = {0}, _sl = {0};
++            _dl.pResource = bb;     _dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++            _sl.pResource = srcimg; _sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++            D3D12_BOX _bx = { 0, 0, 0, (UINT)(_sd.Width < _dd.Width ? _sd.Width : _dd.Width),
++                              (UINT)(_sd.Height < _dd.Height ? _sd.Height : _dd.Height), 1 };
++            g.list->lpVtbl->CopyTextureRegion(g.list, &_dl, 0, 0, 0, &_sl, &_bx);
++        }
++    }
+ 
+     bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -9427,7 +9651,14 @@ void rsx_live_draw_present(u32 buffer_id)
+     bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+     g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
+ 
+-    ld_flush(LD_FLUSH_PRESENT);
++    /* SHARPEN_PATCH: redraw the presented frame through the sharpen shader when the sizes match. */
++    if (g_ps3_sharpen > 0) {
++        D3D12_RESOURCE_DESC _sa, _sb;
++        srcimg->lpVtbl->GetDesc(srcimg, &_sa);
++        bb->lpVtbl->GetDesc(bb, &_sb);
++        if (_sa.Width == _sb.Width && _sa.Height == _sb.Height)
++            ld_sharpen_present(srcimg, bb, target, (u32)_sb.Width, (u32)_sb.Height);
++    }ld_flush(LD_FLUSH_PRESENT);
+     {
+         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
+         if (SUCCEEDED(present_hr))
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 32e8a959..c4acc444 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -93,10 +93,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     }
+ 
+     case WM_KEYDOWN:
+-        if (wp == VK_ESCAPE) {
+-            s_state.window_closed = 1;
+-            DestroyWindow(hwnd);
+-        }
++        if (wp == VK_ESCAPE) { extern volatile int g_ps3_esc_pressed; g_ps3_esc_pressed = 1; } /* ESC_PATCH: Esc only leaves fullscreen */
+         return 0;
+     }
+ 
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 37e37454..2bdf4bac 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -682,6 +682,7 @@ static void write_stat(uint32_t sb, uint32_t mode, uint64_t size,
+     vm_write64(sb + 0x2C, 0x200);        /* blksize */
+ }
+ 
++extern "C" void ppu_dump_guest_stack(ppu_context*, const char*); /* STATBT_DECL */
+ static void cellFsStat(ppu_context* ctx)
+ {
+     char gpath[1024], hpath[1100];
+@@ -691,6 +692,9 @@ static void cellFsStat(ppu_context* ctx)
+     fs_stat64_t st;
+     if (FS_STAT64(hpath, &st) != 0) {
+         if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
++        /* STATBT_PATCH */ { static unsigned _n = 0; _n++;
++          if (_n == 2000 || _n == 50000) {
++              char tg[160]; snprintf(tg, sizeof tg, "statbt n=%u path=%s", _n, gpath); ppu_dump_guest_stack(ctx, tg); } }
+         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+     }
+     if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> OK (size=%lld)\n", gpath, (long long)st.st_size);
+@@ -980,6 +984,23 @@ static uint64_t guest_be64(uint32_t a)
+     return ((uint64_t)guest_be32(a) << 32) | guest_be32(a + 4);
+ }
+ 
++/* FDBRIDGE_PATCH: raw lv2 syscalls (sys_fs.c) fall back here for fds opened through cellFsOpen.
++ * op: 0=read 1=lseek 2=fstat 3=close. Argument registers of the raw syscalls are laid out like the
++ * cellFs imports (fd, buf/off, size/whence, out-ptr). Returns 1 and the result if this layer owns fd. */
++extern "C" int ppu_fs_try_raw(int op, ppu_context* ctx, int64_t* out)
++{
++    int fd = (int)(uint32_t)ctx->gpr[3];
++    if (!fd_file(fd)) return 0;
++    switch (op) {
++        case 0: cellFsRead(ctx);  break;
++        case 1: cellFsLseek(ctx); break;
++        case 2: cellFsFstat(ctx); break;
++        case 3: cellFsClose(ctx); break;
++        default: return 0;
++    }
++    *out = (int64_t)(int32_t)(uint32_t)ctx->gpr[3];
++    return 1;
++}
+ static void cellFsAioInit(ppu_context* ctx)   { ctx->gpr[3] = CELL_OK; }
+ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+ /* Nothing is ever outstanding, so a cancel has nothing to find. Real cellFs
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 84b7ac96..b1a10452 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2206,7 +2206,7 @@ void spu_lockguard_check(spu_context* ctx, uint32_t ea, const uint8_t* src, uint
+ 
+ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint32_t size)
+ {
+-    uint32_t lsa = (uint32_t)(ls - ctx->ls);
++    uint32_t lsa = (uint32_t)(ls - ctx->ls); 
+     spu_ovl_dump(ctx, ea, lsa, ls, size);
+     for (unsigned slot = 0; slot < 4; ++slot) {
+         if (!ctx->resident_code[slot].image_id) continue;
+@@ -2961,6 +2961,9 @@ void spu_indirect_branch(spu_context* ctx)
+               if (PS3_LOG_FIRST(_n, 8))
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
++              
++              { static int dn = 0; const char* cp = getenv("PS3_MIXPLUG_CAPTURE"); if (cp && !dn && p == 0x34A58u) { FILE* df = fopen(cp, "wb"); if (df) { fwrite(ctx->ls + 0x30780, 1, 0x7E80, df); fclose(df); dn = 1; fprintf(stderr, "[mixplug] captured mixer code\n"); } } } /* MIXPLUG_CAPTURE */
++              
+               spu_interp_run(ctx, p);
+               return;
+           } }
+@@ -3406,4 +3409,22 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
+ 
+ #ifdef __cplusplus
+ }
+-#endif
+\ No newline at end of file
++#endif
++/* MSVOL_PATCH: music / effects volume (set by the settings window). The Multistream mixer SPU DMAs a 1168-byte control block
++ * per channel from main memory; the music stream is the stereo one (byte +0x21 == 2). Its gains are 4 big-endian floats. */
++volatile float g_ps3_music_mult = 1.0f;
++volatile float g_ps3_sfx_gain = 1.0f;
++void ms_scale_block(uint8_t* ls, uint32_t size)
++{
++    static const uint32_t gain_off[4] = { 0x58, 0x5C, 0x78, 0x7C };
++    const float m = g_ps3_music_mult;
++    if (size != 1168 || m == 1.0f) return;
++    for (int i = 0; i < 8; i++) if (ls[i] != 0xFF) return;   /* block signature */
++    if (ls[0x21] != 2) return;                                /* stereo = music */
++    for (int i = 0; i < 4; i++) {
++        uint8_t* p = ls + gain_off[i]; uint32_t u; float f;
++        u = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++        memcpy(&f, &u, 4); f *= m; memcpy(&u, &f, 4);
++        p[0] = (uint8_t)(u >> 24); p[1] = (uint8_t)(u >> 16); p[2] = (uint8_t)(u >> 8); p[3] = (uint8_t)u;
++    }
++}
+\ No newline at end of file
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 8c4ccaa8..f9ec4457 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -597,6 +597,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+           } }
+         /* GET: main memory -> local store */
+         memcpy(ls_ptr, ea_ptr, size);
++        /* MSVOL_PATCH */ if (size == 1168) { extern void ms_scale_block(uint8_t*, uint32_t); ms_scale_block((uint8_t*)ls_ptr, size); }
+         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
+          * dword = the completion-word EA arriving in a job buffer. */
+         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+index e435555a..295b1a36 100644
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -328,6 +328,7 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
+  * r6 = mode (permissions, ignored on Windows)
+  * r7 = arg (unused)
+  * -----------------------------------------------------------------------*/
++extern int ppu_fs_try_raw(int op, ppu_context* ctx, int64_t* out); /* FDBRIDGE_PATCH */
+ int64_t sys_fs_open(ppu_context* ctx)
+ {
+     uint32_t path_addr  = LV2_ARG_PTR(ctx, 0);
+@@ -527,6 +528,7 @@ int64_t sys_fs_open(ppu_context* ctx)
+  * -----------------------------------------------------------------------*/
+ int64_t sys_fs_read(ppu_context* ctx)
+ {
++    /* FDBRIDGE_PATCH */ { int32_t _fd = (int32_t)ctx->gpr[3]; int _s = _fd - 3; if (_s < 0 || _s >= SYS_FS_FD_MAX || !g_sys_fs_fds[_s].active) { int64_t _r; if (ppu_fs_try_raw(0, ctx, &_r)) return _r; } }
+     int32_t  fd         = LV2_ARG_S32(ctx, 0);
+     uint32_t buf_addr   = LV2_ARG_PTR(ctx, 1);
+     uint64_t size       = LV2_ARG_U64(ctx, 2);
+@@ -635,6 +637,7 @@ int64_t sys_fs_write(ppu_context* ctx)
+  * -----------------------------------------------------------------------*/
+ int64_t sys_fs_close(ppu_context* ctx)
+ {
++    /* FDBRIDGE_PATCH */ { int32_t _fd = (int32_t)ctx->gpr[3]; int _s = _fd - 3; if (_s < 0 || _s >= SYS_FS_FD_MAX || !g_sys_fs_fds[_s].active) { int64_t _r; if (ppu_fs_try_raw(3, ctx, &_r)) return _r; } }
+     int32_t fd = LV2_ARG_S32(ctx, 0);
+ 
+     int slot = fd - 3;
+@@ -665,6 +668,7 @@ int64_t sys_fs_close(ppu_context* ctx)
+  * -----------------------------------------------------------------------*/
+ int64_t sys_fs_lseek(ppu_context* ctx)
+ {
++    /* FDBRIDGE_PATCH */ { int32_t _fd = (int32_t)ctx->gpr[3]; int _s = _fd - 3; if (_s < 0 || _s >= SYS_FS_FD_MAX || !g_sys_fs_fds[_s].active) { int64_t _r; if (ppu_fs_try_raw(1, ctx, &_r)) return _r; } }
+     int32_t  fd        = LV2_ARG_S32(ctx, 0);
+     int64_t  offset    = LV2_ARG_S64(ctx, 1);
+     int32_t  whence    = LV2_ARG_S32(ctx, 2);
+@@ -794,6 +798,7 @@ int64_t sys_fs_stat(ppu_context* ctx)
+  * -----------------------------------------------------------------------*/
+ int64_t sys_fs_fstat(ppu_context* ctx)
+ {
++    /* FDBRIDGE_PATCH */ { int32_t _fd = (int32_t)ctx->gpr[3]; int _s = _fd - 3; if (_s < 0 || _s >= SYS_FS_FD_MAX || !g_sys_fs_fds[_s].active) { int64_t _r; if (ppu_fs_try_raw(2, ctx, &_r)) return _r; } }
+     int32_t  fd        = LV2_ARG_S32(ctx, 0);
+     uint32_t stat_addr = LV2_ARG_PTR(ctx, 1);
+ 
+diff --git a/tools/build_spu_workloads.py b/tools/build_spu_workloads.py
+index 2eef378b..1cefcd4d 100644
+--- a/tools/build_spu_workloads.py
++++ b/tools/build_spu_workloads.py
+@@ -120,6 +120,12 @@ def main():
+                          "branch, so --auto-functions cannot see it, and dispatch "
+                          "to it lands on address 0 at runtime. "
+                          "e.g. --extra-funcs pm_wwsjob=0xA2C")
++    ap.add_argument("--code-end", action="append", default=[], metavar="IMAGE=ADDR",
++                    help="With --input: clamp the executable range of one discovered SPU "
++                         "program (IMAGE = its name or a unique prefix of its sha256) to "
++                         "end at ADDR, for stripped images whose code is followed by a "
++                         "string/constant tail that does not decode as instructions. "
++                         "Repeatable. e.g. --code-end a0c20a60=0xDE10")
+     ap.add_argument("--constructor", action="store_true",
+                     help="also emit an __attribute__((constructor)) that calls the register fn at startup")
+     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
+diff --git a/tools/spu_program_pipeline.py b/tools/spu_program_pipeline.py
+index 36cbc240..afe9d27c 100644
+--- a/tools/spu_program_pipeline.py
++++ b/tools/spu_program_pipeline.py
+@@ -168,6 +168,13 @@ def build_programs(args, registry_writer):
+             if not sep or name not in {p['name'] for p in unique.values()}:
+                 raise ValueError('--extra-funcs requires discovered content name=ADDR[,ADDR...]')
+             extra[name] = [int(s.strip(), 0) for s in value.split(',')]
++        code_end = {}
++        for spec in getattr(args, 'code_end', []):
++            key, sep, value = spec.partition('=')
++            hits = [n for n in {p['name'] for p in unique.values()} if n == key or n.startswith(key) or n.startswith('spu_' + key)]
++            if not sep or len(hits) != 1:
++                raise ValueError('--code-end requires IMAGE=ADDR where IMAGE names exactly one discovered program')
++            code_end[hits[0]] = int(value.strip(), 0)
+         imgs, text_fps, image_ids = [], {}, {}
+         from find_spu_functions import detect_functions
+         from build_spu_workloads import debase_includes
+@@ -180,7 +187,10 @@ def build_programs(args, registry_writer):
+             blob, info = blobs[digest], layouts[digest]
+             (outdir / 'image.elf').write_bytes(blob)
+             try:
+-                ranges = code_ranges(info)
++                if name in code_end:
++                    ranges = [(a, min(b, code_end[name])) for a, b in code_ranges(info) if a < code_end[name]]
++                else:
++                    ranges = code_ranges(info)
+                 functions, (offset, base, size) = detect_functions(blob, verbose=False)
+                 bounds = sorted({(max(s, a), min(e, b)) for s, e in functions for a, b in ranges
+                                  if max(s, a) < min(e, b)})

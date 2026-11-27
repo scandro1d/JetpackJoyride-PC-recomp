@@ -1,0 +1,38 @@
+# Allowlist: ignore everything, then re-include only our own source.
+# This repo is PUBLIC - never commit game files, .rap keys, decrypted/recompiled game code,
+# save data, build output or logs.
+/*
+
+!/.gitignore
+!/README.md
+!/LICENSE
+!/JetpackJoyride-Builder-test
+!/SETUP.md
+
+# Top-level scripts and project source
+!/*.ps1
+!/CMakeLists.txt
+!/main.cpp
+!/stubs.cpp
+!/settings_menu.h
+!/config.toml
+!/jj_unpak.py
+
+# Folders with our own source
+!/builder/
+/builder/*.exe
+/builder/builder.ini
+!/patches/
+!/project/
+!/tools/
+
+# Never, even if re-included above
+*.pkg
+*.rap
+*.edat
+*.elf
+*.ELF
+*.pak
+*.sav
+*.SAV
+*.log

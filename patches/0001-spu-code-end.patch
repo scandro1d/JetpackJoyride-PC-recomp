@@ -1,0 +1,47 @@
+diff --git a/tools/build_spu_workloads.py b/tools/build_spu_workloads.py
+index 2eef378..1cefcd4 100644
+--- a/tools/build_spu_workloads.py
++++ b/tools/build_spu_workloads.py
+@@ -120,6 +120,12 @@ def main():
+                          "branch, so --auto-functions cannot see it, and dispatch "
+                          "to it lands on address 0 at runtime. "
+                          "e.g. --extra-funcs pm_wwsjob=0xA2C")
++    ap.add_argument("--code-end", action="append", default=[], metavar="IMAGE=ADDR",
++                    help="With --input: clamp the executable range of one discovered SPU "
++                         "program (IMAGE = its name or a unique prefix of its sha256) to "
++                         "end at ADDR, for stripped images whose code is followed by a "
++                         "string/constant tail that does not decode as instructions. "
++                         "Repeatable. e.g. --code-end a0c20a60=0xDE10")
+     ap.add_argument("--constructor", action="store_true",
+                     help="also emit an __attribute__((constructor)) that calls the register fn at startup")
+     ap.add_argument("--relift", action="store_true", help="re-lift even if a prior lift exists")
+diff --git a/tools/spu_program_pipeline.py b/tools/spu_program_pipeline.py
+index 36cbc24..afe9d27 100644
+--- a/tools/spu_program_pipeline.py
++++ b/tools/spu_program_pipeline.py
+@@ -168,6 +168,13 @@ def build_programs(args, registry_writer):
+             if not sep or name not in {p['name'] for p in unique.values()}:
+                 raise ValueError('--extra-funcs requires discovered content name=ADDR[,ADDR...]')
+             extra[name] = [int(s.strip(), 0) for s in value.split(',')]
++        code_end = {}
++        for spec in getattr(args, 'code_end', []):
++            key, sep, value = spec.partition('=')
++            hits = [n for n in {p['name'] for p in unique.values()} if n == key or n.startswith(key) or n.startswith('spu_' + key)]
++            if not sep or len(hits) != 1:
++                raise ValueError('--code-end requires IMAGE=ADDR where IMAGE names exactly one discovered program')
++            code_end[hits[0]] = int(value.strip(), 0)
+         imgs, text_fps, image_ids = [], {}, {}
+         from find_spu_functions import detect_functions
+         from build_spu_workloads import debase_includes
+@@ -180,7 +187,10 @@ def build_programs(args, registry_writer):
+             blob, info = blobs[digest], layouts[digest]
+             (outdir / 'image.elf').write_bytes(blob)
+             try:
+-                ranges = code_ranges(info)
++                if name in code_end:
++                    ranges = [(a, min(b, code_end[name])) for a, b in code_ranges(info) if a < code_end[name]]
++                else:
++                    ranges = code_ranges(info)
+                 functions, (offset, base, size) = detect_functions(blob, verbose=False)
+                 bounds = sorted({(max(s, a), min(e, b)) for s, e in functions for a, b in ranges
+                                  if max(s, a) < min(e, b)})
